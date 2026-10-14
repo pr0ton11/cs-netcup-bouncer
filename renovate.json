@@ -1,0 +1,17 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":semanticCommits"],
+  "postUpdateOptions": ["gomodTidy"],
+  "packageRules": [
+    {
+      "description": "Update the Go toolchain in go.mod and the builder image together",
+      "matchDatasources": ["golang-version"],
+      "groupName": "Go"
+    },
+    {
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["docker.io/library/golang"],
+      "groupName": "Go"
+    }
+  ]
+}
