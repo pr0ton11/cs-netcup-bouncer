@@ -33,6 +33,14 @@ The bouncer never blocks these addresses:
 
 The bouncer writes to netcup only when the rules change, and at most once in each `SYNC_INTERVAL`. If a call to netcup fails, the bouncer waits between 1 and 30 minutes before it tries again.
 
+## Local bans and the community blocklist
+
+The origin of a ban is the source that made it. A scenario is a CrowdSec rule that detects an attack in the logs. CrowdSec uses `crowdsec` for bans from its scenarios, `cscli` for bans that you add by hand, and `CAPI` for the community blocklist. The community blocklist is a list of addresses that other CrowdSec users report. It holds thousands of bans, and most of them last several days.
+
+Put only local bans into the netcup firewall. netcup allows 500 effective rules in one policy, and the bouncer keeps the bans that last longest. Thus the community bans push out the shorter bans for the attackers that hit your server. To prevent this, set `CROWDSEC_ORIGINS=crowdsec,cscli`. Block the community blocklist on the server itself, for example with the CrowdSec firewall bouncer for nftables.
+
+If you change `CROWDSEC_ORIGINS`, restart the bouncer. At the start, the bouncer reads all bans again. It then writes the DROP policy without the bans from the origins that you removed.
+
 ## Configuration
 
 You configure the bouncer with environment variables. The three required variables have no default, and the bouncer does not start without them.
