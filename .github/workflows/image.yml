@@ -38,6 +38,7 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: type=semver,pattern={{version}}
+          flavor: latest=false
       # Go cross-compiles in the build stage, so neither platform needs emulation.
       - uses: docker/build-push-action@v7
         with:
