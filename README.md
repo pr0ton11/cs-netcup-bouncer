@@ -1,57 +1,75 @@
 # cs-netcup-bouncer
 
-A CrowdSec bouncer that blocks banned addresses in the [netcup firewall](https://www.netcup.com/en/helpcenter/documentation/server/firewall), so their traffic never reaches the server.
+cs-netcup-bouncer is a CrowdSec bouncer for the [netcup firewall](https://www.netcup.com/en/helpcenter/documentation/server/firewall). A bouncer is a program that applies the bans that CrowdSec decides. This bouncer adds the banned addresses to the firewall of a netcup server, so that their traffic does not reach the server.
 
-It polls the CrowdSec local API and only adds blocks; your own firewall rules keep working. It owns two policies:
+## How it works
 
-| Policy | Rules | Attached |
+The bouncer reads the active bans from the CrowdSec local API (LAPI), by default every 30 seconds. It writes them to the netcup firewall through the API of the netcup Server Control Panel (SCP). netcup puts firewall rules into policies. A policy that you create is a user policy. The bouncer creates two user policies and attaches them to the network interface of the server:
+
+| Policy | Rules | Position |
 |---|---|---|
-| `<NETCUP_POLICY_NAME>` | `INGRESS DROP` for the banned addresses | first among the user policies |
-| `<NETCUP_POLICY_NAME>-fallback` | accept all, both directions | last, and only while you have no user policy of your own |
+| `<NETCUP_POLICY_NAME>` | `INGRESS DROP` rules for the banned addresses | First of all user policies |
+| `<NETCUP_POLICY_NAME>-fallback` | Rules that accept all traffic in both directions | Last, and only if you have no user policy of your own |
 
-Attaching any user policy switches netcup's implicit rules to `DROP_ALL`. If you have no policy of your own, the fallback restores what the interface did before. If you do, your policies decide what is allowed, exactly as without the bouncer. When you attach or detach one later, the next drift check adds or removes the fallback.
+netcup applies the first rule that matches a packet. The policies apply in the order in which they are attached to the interface. A live test on a netcup server showed this order. The DROP policy is first, so an ACCEPT rule in a later policy cannot let a banned address through.
 
-User policies apply in the order they are attached (live-tested), so the DROP policy goes first. Copied policies such as "netcup Ping allow" seem to come before all user policies: with it attached, an ICMP block did not stop ping. Keep that in mind before adding ICMP to `NETCUP_DROP_PROTOCOLS`.
+The fallback policy exists because of the implicit rules. An implicit rule is the default for traffic that no rule matches. If an interface has no user policy, the implicit rules accept all traffic. If you attach a user policy, netcup changes the implicit rules to `DROP_ALL`. If you have no policy of your own, the fallback accepts the traffic that the implicit rules accepted before. If you have policies of your own, they decide what is allowed, and the bouncer does not attach the fallback.
 
-- Addresses stay in memory and on netcup's firewall only, never on disk or in logs. On shutdown the DROP policy is emptied; the fallback stays.
-- At most `NETCUP_MAX_RULES` effective rules (netcup counts each address once). If there are more bans than fit, the longest-lasting are kept.
-- Never blocks `NEVER_BLOCK`, private addresses, or ranges wider than /16 (IPv4) or /32 (IPv6).
-- Writes only on change, at most every `SYNC_INTERVAL`, and backs off on errors.
+The bouncer reads its two policies and the interface back every `DRIFT_CHECK_INTERVAL`. This drift check corrects all changes that somebody made to the two policies. If you attach or detach a policy of your own, the drift check adds or removes the fallback.
 
-Image: `ghcr.io/pr0ton11/cs-netcup-bouncer` (linux/amd64, linux/arm64, distroless).
+A copied policy is a policy that netcup supplies, for example "netcup Ping allow". Copied policies probably apply before all user policies. In a test, an ICMP DROP rule did not stop ping while "netcup Ping allow" was attached. If you add ICMP to `NETCUP_DROP_PROTOCOLS`, a copied policy can accept the ICMP traffic before the DROP rule.
+
+## Privacy and limits
+
+The bouncer keeps the banned addresses in memory and in the netcup firewall only. It does not write them to disk or to the logs. By default, the bouncer removes all DROP rules when it stops. It keeps the fallback, so that the server stays reachable.
+
+netcup allows 500 effective rules in one policy. An effective rule is one address in one rule. The DROP policy uses at most `NETCUP_MAX_RULES` effective rules. If more bans are active than fit, the bouncer keeps the bans that last longest.
+
+The bouncer never blocks these addresses:
+
+- The addresses and prefixes in `NEVER_BLOCK`
+- Private, loopback, link-local and multicast addresses
+- Ranges wider than /16 for IPv4 or /32 for IPv6
+
+The bouncer writes to netcup only when the rules change, and at most once in each `SYNC_INTERVAL`. If a call to netcup fails, the bouncer waits between 1 and 30 minutes before it tries again.
 
 ## Configuration
 
+You configure the bouncer with environment variables. The three required variables have no default, and the bouncer does not start without them.
+
 | Variable | Default | Description |
 |---|---|---|
-| `NETCUP_USER_ID` | required | SCP user ID: the `id` claim printed by `go run github.com/pr0ton11/netcup-scp-go/cmd/scp-login`, not the customer number |
-| `NETCUP_SERVER_ID` | required | ID of the server in the SCP |
-| `NETCUP_INTERFACE_MAC` | required | MAC address of the server's public interface |
-| `NETCUP_REFRESH_TOKEN_FILE` | `/run/secrets/netcup-refresh-token` | File with the SCP offline refresh token; only read, never written |
-| `NETCUP_POLICY_NAME` | `crowdsec-bouncer` | Name of the DROP policy; the fallback is `<name>-fallback` |
-| `NETCUP_DROP_PROTOCOLS` | `TCP,UDP` | Protocols that get DROP rules for banned addresses |
-| `NETCUP_MAX_RULES` | `400` | Budget of effective rules for the DROP policy (netcup allows 500 per policy and counts each address once) |
-| `NETCUP_API_URL` | `https://www.servercontrolpanel.de/scp-core` | Base URL of the SCP REST API |
-| `CROWDSEC_LAPI_URL` | `http://127.0.0.1:8080` | URL of the CrowdSec local API |
-| `CROWDSEC_LAPI_KEY_FILE` | `/run/secrets/netcup-bouncer-lapi-key` | File with the bouncer API key from `cscli bouncers add` |
-| `CROWDSEC_LAPI_KEY` | | Bouncer API key; overrides `CROWDSEC_LAPI_KEY_FILE` |
-| `NEVER_BLOCK` | | Comma-separated addresses or prefixes that are never blocked, such as the server's own |
-| `POLL_INTERVAL` | `30s` | How often to pull decisions from the LAPI |
-| `SYNC_INTERVAL` | `2m` | Minimum time between two policy writes |
-| `DRIFT_CHECK_INTERVAL` | `1h` | How often to read the policy and its assignment back and correct changes |
-| `ACCEPT_ONLY` | `false` | Keep the DROP policy empty, for a safe first rollout |
-| `DRY_RUN` | `false` | Log the policy instead of calling netcup; needs no netcup credentials |
-| `CLEAR_ON_EXIT` | `true` | Empty the DROP policy on shutdown |
-| `LOG_FORMAT` | `json` | Log format: `json` or `text` |
-| `DEBUG` | `false` | Log at debug level |
+| `NETCUP_USER_ID` | required | Your SCP user ID. `go run github.com/pr0ton11/netcup-scp-go/cmd/scp-login` prints it as the `id` claim. It is not your customer number. |
+| `NETCUP_SERVER_ID` | required | The ID of the server in the SCP |
+| `NETCUP_INTERFACE_MAC` | required | The MAC address of the public network interface of the server |
+| `NETCUP_REFRESH_TOKEN_FILE` | `/run/secrets/netcup-refresh-token` | The file with the SCP refresh token. The bouncer reads this file and never writes it. |
+| `NETCUP_POLICY_NAME` | `crowdsec-bouncer` | The name of the DROP policy. The fallback policy gets the name `<name>-fallback`. |
+| `NETCUP_DROP_PROTOCOLS` | `TCP,UDP` | The protocols that get DROP rules for the banned addresses |
+| `NETCUP_MAX_RULES` | `400` | The maximum number of effective rules in the DROP policy |
+| `NETCUP_API_URL` | `https://www.servercontrolpanel.de/scp-core` | The base URL of the SCP API |
+| `CROWDSEC_LAPI_URL` | `http://127.0.0.1:8080` | The URL of the CrowdSec LAPI |
+| `CROWDSEC_LAPI_KEY_FILE` | `/run/secrets/netcup-bouncer-lapi-key` | The file with the API key that `cscli bouncers add` makes |
+| `CROWDSEC_LAPI_KEY` | | The API key itself. If you set it, the bouncer ignores `CROWDSEC_LAPI_KEY_FILE`. |
+| `NEVER_BLOCK` | | A comma-separated list of addresses and prefixes that the bouncer never blocks, for example the addresses of the server |
+| `POLL_INTERVAL` | `30s` | The time between two reads from the LAPI |
+| `SYNC_INTERVAL` | `2m` | The minimum time between two writes to a policy |
+| `DRIFT_CHECK_INTERVAL` | `1h` | The time between two drift checks |
+| `ACCEPT_ONLY` | `false` | If `true`, the bouncer keeps the DROP policy empty. Use it for the first start. |
+| `DRY_RUN` | `false` | If `true`, the bouncer logs the DROP policy and does not call netcup. It needs no netcup credentials. |
+| `CLEAR_ON_EXIT` | `true` | If `true`, the bouncer empties the DROP policy when it stops |
+| `LOG_FORMAT` | `json` | The log format: `json` or `text` |
+| `DEBUG` | `false` | If `true`, the bouncer also writes debug messages |
 
 ## Run
 
-The bouncer needs to reach the CrowdSec LAPI, for example by sharing its network namespace:
+The bouncer must connect to the CrowdSec LAPI. In this example, the bouncer container uses the network of the `crowdsec` container. The image runs as user ID 65532, so this user must be able to read the two secret files.
+
+1. On the CrowdSec host, make an API key for the bouncer: `cscli bouncers add netcup -o raw > lapi-key`.
+2. Get a refresh token for the SCP: `go run github.com/pr0ton11/netcup-scp-go/cmd/scp-login -o netcup-refresh-token`.
+3. Give user 65532 read access to the two files, and start the container:
 
 ```sh
-cscli bouncers add netcup -o raw > lapi-key
-chown 65532 lapi-key netcup-refresh-token && chmod 400 lapi-key netcup-refresh-token  # the image runs as uid 65532
+chown 65532 lapi-key netcup-refresh-token && chmod 400 lapi-key netcup-refresh-token
 docker run -d \
   --name netcup-bouncer \
   --restart always \
@@ -63,18 +81,22 @@ docker run -d \
   -e NETCUP_INTERFACE_MAC=<interface-mac> \
   -e NEVER_BLOCK=<server-addresses> \
   -e ACCEPT_ONLY=true \
-  ghcr.io/pr0ton11/cs-netcup-bouncer:0.1.0
+  ghcr.io/pr0ton11/cs-netcup-bouncer:0.1.1
 ```
 
-Roll out with the SCP console open: `DRY_RUN=true` first, then `ACCEPT_ONLY=true`, then neither.
+Open the SCP console in a browser before the first start. If the firewall blocks your access to the server, you can change the policies there. Then start the bouncer in three stages:
+
+1. Start it with `DRY_RUN=true`. Make sure that the log shows the number of bans that you expect.
+2. Start it with `ACCEPT_ONLY=true`. Make sure that all services and SSH are reachable from outside.
+3. Remove `ACCEPT_ONLY`. The bouncer starts to block the banned addresses.
 
 ## Development
+
+Run the tests and build a local image with these commands. A push of a `v*` tag builds the images for linux/amd64 and linux/arm64. The images are published on GHCR as `ghcr.io/pr0ton11/cs-netcup-bouncer`.
 
 ```sh
 go test -race ./...
 podman build -t localhost/cs-netcup-bouncer:dev .
 ```
 
-## License
-
-Apache License 2.0, see [LICENSE](LICENSE).
+The code is available under the Apache License 2.0. See [LICENSE](LICENSE).
