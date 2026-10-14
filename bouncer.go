@@ -63,7 +63,7 @@ type bouncer struct {
 }
 
 func newBouncer(cfg bouncerConfig, lapi *lapiClient, fw *netcupFirewall, log *slog.Logger) *bouncer {
-	return &bouncer{cfg: cfg, lapi: lapi, fw: fw, log: log, set: newDecisionSet(), needStartup: true}
+	return &bouncer{cfg: cfg, lapi: lapi, fw: fw, log: log, set: newDecisionSet(lapi.origins), needStartup: true}
 }
 
 func (b *bouncer) run(ctx context.Context) error {

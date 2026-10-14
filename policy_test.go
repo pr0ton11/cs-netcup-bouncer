@@ -38,7 +38,7 @@ func TestParseBan(t *testing.T) {
 
 func TestDecisionSet(t *testing.T) {
 	now := time.Unix(1000, 0)
-	s := newDecisionSet()
+	s := newDecisionSet(nil)
 	s.apply(&streamResponse{New: []lapiDecision{
 		{ID: 1, Type: "ban", Scope: "Ip", Value: "203.0.113.1", Duration: "1h"},
 		{ID: 2, Type: "ban", Scope: "Ip", Value: "203.0.113.1", Duration: "3h"}, // same IP, longer
@@ -132,5 +132,26 @@ func TestBuildRules(t *testing.T) {
 	rules, st = buildRules(cfg, bans, true)
 	if len(rules) != 0 || st != (policyStats{active: 200}) {
 		t.Fatalf("accept only: %d rules, %+v", len(rules), st)
+	}
+}
+
+func TestDecisionSetOrigins(t *testing.T) {
+	now := time.Unix(1000, 0)
+	s := newDecisionSet([]string{"crowdsec", "cscli"})
+	skipped := s.apply(&streamResponse{New: []lapiDecision{
+		{ID: 1, Origin: "crowdsec", Type: "ban", Scope: "Ip", Value: "203.0.113.1", Duration: "4h"},
+		{ID: 2, Origin: "cscli", Type: "ban", Scope: "Ip", Value: "203.0.113.2", Duration: "4h"},
+		{ID: 3, Origin: "CAPI", Type: "ban", Scope: "Ip", Value: "203.0.113.3", Duration: "96h"},
+		{ID: 4, Origin: "capi", Type: "ban", Scope: "Ip", Value: "203.0.113.4", Duration: "96h"}, // origins match exactly, like the LAPI
+	}}, true, now)
+	if got, want := prefixes(s.active(now, nil)), "203.0.113.1/32 203.0.113.2/32"; got != want || skipped != 2 {
+		t.Fatalf("active = %s (skipped %d), want %s (skipped 2)", got, skipped, want)
+	}
+
+	// No origins: everything is kept.
+	all := newDecisionSet(nil)
+	all.apply(&streamResponse{New: []lapiDecision{{ID: 3, Origin: "CAPI", Type: "ban", Scope: "Ip", Value: "203.0.113.3", Duration: "96h"}}}, true, now)
+	if len(all.active(now, nil)) != 1 {
+		t.Fatal("empty filter dropped a decision")
 	}
 }

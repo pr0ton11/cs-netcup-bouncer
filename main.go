@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -83,7 +84,12 @@ func run(log *slog.Logger) error {
 		check(err)
 	}
 	httpClient := &http.Client{Timeout: 30 * time.Second}
-	lapi := &lapiClient{baseURL: env("CROWDSEC_LAPI_URL", "http://127.0.0.1:8080"), apiKey: apiKey, http: httpClient}
+	lapi := &lapiClient{
+		baseURL: env("CROWDSEC_LAPI_URL", "http://127.0.0.1:8080"),
+		apiKey:  apiKey,
+		origins: envList("CROWDSEC_ORIGINS"),
+		http:    httpClient,
+	}
 
 	var fw *netcupFirewall
 	if !cfg.dryRun {
@@ -116,7 +122,8 @@ func run(log *slog.Logger) error {
 
 	log.Info("starting", "version", version, "dry_run", cfg.dryRun, "accept_only", cfg.acceptOnly,
 		"policy", cfg.policyName, "fallback_policy", cfg.fallbackName(), "drop_protocols", fmt.Sprint(cfg.policy.dropProtocols),
-		"max_blocked", cfg.policy.maxBlocked(), "never_block", len(cfg.policy.neverBlock))
+		"max_blocked", cfg.policy.maxBlocked(), "never_block", len(cfg.policy.neverBlock),
+		"origins", originsLabel(lapi.origins))
 	return newBouncer(cfg, lapi, fw, log).run(ctx)
 }
 
@@ -216,6 +223,24 @@ func envProtocols(key, def string) ([]scp.FirewallProtocol, error) {
 		return nil, fmt.Errorf("%s: no protocols", key)
 	}
 	return out, nil
+}
+
+// envList returns the comma-separated values of key, without duplicates, in order.
+func envList(key string) []string {
+	var out []string
+	for _, v := range strings.FieldsFunc(os.Getenv(key), isListSep) {
+		if !slices.Contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func originsLabel(origins []string) string {
+	if len(origins) == 0 {
+		return "all"
+	}
+	return strings.Join(origins, ",")
 }
 
 func isListSep(r rune) bool { return r == ',' || r == ' ' || r == '\n' || r == '\t' }

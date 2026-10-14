@@ -25,14 +25,26 @@ type ban struct {
 // the LAPI deletes them or when they expire, whichever comes first.
 type decisionSet struct {
 	byID map[int64]ban
+	// origins, if not empty, holds the only origins whose decisions are kept. The LAPI
+	// filters on them too; this keeps a LAPI that ignores the filter from filling the
+	// rule budget.
+	origins map[string]bool
 }
 
-func newDecisionSet() *decisionSet {
-	return &decisionSet{byID: map[int64]ban{}}
+func newDecisionSet(origins []string) *decisionSet {
+	s := &decisionSet{byID: map[int64]ban{}}
+	if len(origins) > 0 {
+		s.origins = map[string]bool{}
+		for _, o := range origins {
+			s.origins[o] = true
+		}
+	}
+	return s
 }
 
 // apply merges a stream response into the set. With startup set, it replaces the set.
-// It returns the number of decisions it skipped because they are not IP bans.
+// It returns the number of decisions it skipped because they are not IP bans or come
+// from an origin that is not wanted.
 func (s *decisionSet) apply(sr *streamResponse, startup bool, now time.Time) (skipped int) {
 	if startup {
 		clear(s.byID)
@@ -41,6 +53,10 @@ func (s *decisionSet) apply(sr *streamResponse, startup bool, now time.Time) (sk
 		delete(s.byID, d.ID)
 	}
 	for _, d := range sr.New {
+		if s.origins != nil && !s.origins[d.Origin] {
+			skipped++
+			continue
+		}
 		b, err := parseBan(d, now)
 		if err != nil {
 			skipped++

@@ -213,6 +213,7 @@ type fakeLAPI struct {
 	mu       sync.Mutex
 	queue    []streamResponse
 	startups int
+	origins  []string // origins query parameter of each request; the fake ignores it
 }
 
 func (f *fakeLAPI) push(sr streamResponse) {
@@ -231,6 +232,7 @@ func (f *fakeLAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("startup") == "true" {
 		f.startups++
 	}
+	f.origins = append(f.origins, r.URL.Query().Get("origins"))
 	sr := streamResponse{}
 	if len(f.queue) > 0 {
 		sr, f.queue = f.queue[0], f.queue[1:]
@@ -518,5 +520,72 @@ func TestLogFormat(t *testing.T) {
 	l, _ := newLogger()
 	if _, ok := l.Handler().(*slog.JSONHandler); !ok {
 		t.Errorf("default handler is %T, want JSON", l.Handler())
+	}
+}
+
+func TestOriginFilter(t *testing.T) {
+	h := newHarness(t)
+	h.lc.origins = []string{"crowdsec", "cscli"}
+	h.lapi.push(streamResponse{New: []lapiDecision{
+		{ID: 1, Origin: "crowdsec", Type: "ban", Scope: "Ip", Value: "203.0.113.1", Duration: "4h"},
+		{ID: 2, Origin: "cscli", Type: "ban", Scope: "Ip", Value: "203.0.113.2", Duration: "4h"},
+		{ID: 3, Origin: "CAPI", Type: "ban", Scope: "Range", Value: "198.51.100.0/24", Duration: "96h"},
+	}})
+	b := h.bouncer()
+	b.step(context.Background(), time.Now())
+
+	if got := h.lapi.origins; len(got) != 1 || got[0] != "crowdsec,cscli" {
+		t.Errorf("origins query = %q, want crowdsec,cscli", got)
+	}
+	// The fake LAPI ignores the parameter; the bouncer's own filter drops the CAPI ban.
+	drop := h.scp.byName("crowdsec-bouncer")
+	if got, want := sources(h.scp.rules(drop)), []string{"TCP:203.0.113.1,203.0.113.2", "UDP:203.0.113.1,203.0.113.2"}; !slices.Equal(got, want) {
+		t.Fatalf("DROP rules = %v, want %v", got, want)
+	}
+}
+
+func TestOriginFilterChangeOnRestart(t *testing.T) {
+	h := newHarness(t)
+	all := streamResponse{New: []lapiDecision{
+		{ID: 1, Origin: "crowdsec", Type: "ban", Scope: "Ip", Value: "203.0.113.1", Duration: "4h"},
+		{ID: 3, Origin: "CAPI", Type: "ban", Scope: "Ip", Value: "198.51.100.7", Duration: "96h"},
+	}}
+	ctx, now := context.Background(), time.Now()
+
+	// Without a filter, the community ban is blocked too.
+	h.lapi.push(all)
+	h.bouncer().step(ctx, now)
+	drop := h.scp.byName("crowdsec-bouncer")
+	if got := sources(h.scp.rules(drop)); len(got) != 2 || !strings.Contains(got[0], "198.51.100.7") {
+		t.Fatalf("before: %v", got)
+	}
+
+	// Restart with the filter: the startup pull rewrites the policy without it.
+	h.lc.origins = []string{"crowdsec", "cscli"}
+	h.lapi.push(all)
+	h.bouncer().step(ctx, now.Add(time.Minute))
+	if got, want := sources(h.scp.rules(drop)), []string{"TCP:203.0.113.1", "UDP:203.0.113.1"}; !slices.Equal(got, want) {
+		t.Fatalf("after restart: %v, want %v", got, want)
+	}
+	if h.lapi.startups != 2 {
+		t.Errorf("startups = %d, want 2", h.lapi.startups)
+	}
+}
+
+func TestEnvList(t *testing.T) {
+	for _, tt := range []struct{ in, want string }{
+		{"", "all"},
+		{"crowdsec,cscli", "crowdsec,cscli"},
+		{" crowdsec, cscli ,crowdsec", "crowdsec,cscli"},
+		{"CAPI", "CAPI"},
+	} {
+		t.Setenv("CROWDSEC_ORIGINS", tt.in)
+		if got := originsLabel(envList("CROWDSEC_ORIGINS")); got != tt.want {
+			t.Errorf("CROWDSEC_ORIGINS=%q: got %q, want %q", tt.in, got, tt.want)
+		}
+	}
+	t.Setenv("CROWDSEC_ORIGINS", "")
+	if got := envList("CROWDSEC_ORIGINS"); got != nil {
+		t.Errorf("empty: got %q, want nil", got)
 	}
 }

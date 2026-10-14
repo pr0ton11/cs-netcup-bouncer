@@ -30,6 +30,7 @@ type streamResponse struct {
 type lapiClient struct {
 	baseURL string
 	apiKey  string
+	origins []string // if set, only decisions from these origins
 	http    *http.Client
 }
 
@@ -39,6 +40,9 @@ func (c *lapiClient) stream(ctx context.Context, startup bool) (*streamResponse,
 	q := url.Values{
 		"startup": {fmt.Sprint(startup)},
 		"scopes":  {"ip,range"},
+	}
+	if len(c.origins) > 0 {
+		q.Set("origins", strings.Join(c.origins, ","))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(c.baseURL, "/")+"/v1/decisions/stream?"+q.Encode(), nil)
 	if err != nil {

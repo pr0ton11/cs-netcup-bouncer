@@ -50,6 +50,7 @@ You configure the bouncer with environment variables. The three required variabl
 | `CROWDSEC_LAPI_URL` | `http://127.0.0.1:8080` | The URL of the CrowdSec LAPI |
 | `CROWDSEC_LAPI_KEY_FILE` | `/run/secrets/netcup-bouncer-lapi-key` | The file with the API key that `cscli bouncers add` makes |
 | `CROWDSEC_LAPI_KEY` | | The API key itself. If you set it, the bouncer ignores `CROWDSEC_LAPI_KEY_FILE`. |
+| `CROWDSEC_ORIGINS` | | A comma-separated list of origins, for example `crowdsec,cscli`. The bouncer blocks only the bans from these origins. If the list is empty, it blocks the bans from all origins. The names are case-sensitive. |
 | `NEVER_BLOCK` | | A comma-separated list of addresses and prefixes that the bouncer never blocks, for example the addresses of the server |
 | `POLL_INTERVAL` | `30s` | The time between two reads from the LAPI |
 | `SYNC_INTERVAL` | `2m` | The minimum time between two writes to a policy |
