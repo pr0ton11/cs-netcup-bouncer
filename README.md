@@ -34,6 +34,7 @@ Image: `ghcr.io/pr0ton11/cs-netcup-bouncer` (linux/amd64, linux/arm64, distroles
 | `ACCEPT_ONLY` | `false` | Write only the ACCEPT rules, for a safe first rollout |
 | `DRY_RUN` | `false` | Log the policy instead of calling netcup; needs no netcup credentials |
 | `CLEAR_ON_EXIT` | `true` | Remove the DROP rules on shutdown |
+| `LOG_FORMAT` | `json` | Log format: `json` or `text` |
 | `DEBUG` | `false` | Log at debug level |
 
 ## Run

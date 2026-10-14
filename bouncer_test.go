@@ -391,3 +391,20 @@ func TestLoadAcceptRulesExample(t *testing.T) {
 		t.Fatalf("got %d rules", len(rules))
 	}
 }
+
+func TestLogFormat(t *testing.T) {
+	for _, tt := range []struct {
+		format string
+		ok     bool
+	}{{"", true}, {"json", true}, {"text", true}, {"logfmt", false}} {
+		t.Setenv("LOG_FORMAT", tt.format)
+		if _, err := newLogger(); (err == nil) != tt.ok {
+			t.Errorf("LOG_FORMAT=%q: err = %v", tt.format, err)
+		}
+	}
+	t.Setenv("LOG_FORMAT", "")
+	l, _ := newLogger()
+	if _, ok := l.Handler().(*slog.JSONHandler); !ok {
+		t.Errorf("default handler is %T, want JSON", l.Handler())
+	}
+}

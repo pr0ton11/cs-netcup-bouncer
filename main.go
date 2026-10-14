@@ -32,11 +32,11 @@ func main() {
 		fmt.Println(version)
 		return
 	}
-	level := slog.LevelInfo
-	if envBool("DEBUG", false) {
-		level = slog.LevelDebug
+	log, err := newLogger()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	if err := run(log); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
@@ -118,9 +118,25 @@ func run(log *slog.Logger) error {
 	}
 
 	log.Info("starting", "version", version, "dry_run", cfg.dryRun, "accept_only", cfg.acceptOnly,
-		"policy", cfg.policyName, "accept_rules", len(cfg.policy.accept), "drop_protocols", cfg.policy.dropProtocols,
+		"policy", cfg.policyName, "accept_rules", len(cfg.policy.accept), "drop_protocols", fmt.Sprint(cfg.policy.dropProtocols),
 		"max_blocked", cfg.policy.maxBlocked(), "never_block", len(cfg.policy.neverBlock))
 	return newBouncer(cfg, lapi, fw, log).run(ctx)
+}
+
+// newLogger returns a logger in LOG_FORMAT: json (the default) or text.
+func newLogger() (*slog.Logger, error) {
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	if envBool("DEBUG", false) {
+		opts.Level = slog.LevelDebug
+	}
+	switch f := env("LOG_FORMAT", "json"); f {
+	case "json":
+		return slog.New(slog.NewJSONHandler(os.Stderr, opts)), nil
+	case "text":
+		return slog.New(slog.NewTextHandler(os.Stderr, opts)), nil
+	default:
+		return nil, fmt.Errorf("LOG_FORMAT: want json or text, got %q", f)
+	}
 }
 
 func env(key, def string) string {
