@@ -129,7 +129,7 @@ func TestBuildRules(t *testing.T) {
 	}
 
 	rules, st = buildRules(cfg, bans, true)
-	if len(rules) != 8 || st.blocked != 0 {
+	if len(rules) != 8 || st != (policyStats{active: 200}) {
 		t.Fatalf("accept only: %d rules, %+v", len(rules), st)
 	}
 }

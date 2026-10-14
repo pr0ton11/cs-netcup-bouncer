@@ -85,14 +85,14 @@ type policyStats struct {
 // rules. bans must be ordered by priority; the ones beyond the budget are left out.
 func buildRules(c policyConfig, bans []ban, acceptOnly bool) ([]scp.FirewallRule, policyStats) {
 	st := policyStats{active: len(bans)}
+	// With acceptOnly, blocking nothing is the point; no ban is over budget.
 	if acceptOnly {
 		bans = nil
-	}
-	if n := c.maxBlocked(); len(bans) > n {
+	} else if n := c.maxBlocked(); len(bans) > n {
+		st.dropped = len(bans) - n
 		bans = bans[:n]
 	}
 	st.blocked = len(bans)
-	st.dropped = st.active - st.blocked
 
 	prefixes := make([]netip.Prefix, len(bans))
 	for i, b := range bans {
