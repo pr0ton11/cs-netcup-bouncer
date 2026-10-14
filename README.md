@@ -43,11 +43,17 @@ The bouncer needs to reach the CrowdSec LAPI, for example by sharing its network
 ```sh
 cscli bouncers add netcup -o raw > lapi-key
 chown 65532 lapi-key netcup-refresh-token && chmod 400 lapi-key netcup-refresh-token  # the image runs as uid 65532
-docker run -d --name netcup-bouncer --restart always --network container:crowdsec \
+docker run -d \
+  --name netcup-bouncer \
+  --restart always \
+  --network container:crowdsec \
   -v ./lapi-key:/run/secrets/netcup-bouncer-lapi-key:ro \
   -v ./netcup-refresh-token:/run/secrets/netcup-refresh-token:ro \
-  -e NETCUP_USER_ID=... -e NETCUP_SERVER_ID=... -e NETCUP_INTERFACE_MAC=... \
-  -e NEVER_BLOCK=<server addresses> -e ACCEPT_ONLY=true \
+  -e NETCUP_USER_ID=<scp-user-id> \
+  -e NETCUP_SERVER_ID=<server-id> \
+  -e NETCUP_INTERFACE_MAC=<interface-mac> \
+  -e NEVER_BLOCK=<server-addresses> \
+  -e ACCEPT_ONLY=true \
   ghcr.io/pr0ton11/cs-netcup-bouncer:0.1.0
 ```
 
