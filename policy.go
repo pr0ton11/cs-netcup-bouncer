@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
-	"os"
 	"slices"
 
 	"github.com/pr0ton11/netcup-scp-go/scp"
@@ -13,21 +12,18 @@ import (
 // maxSourcesPerRule is netcup's limit of addresses in one rule.
 const maxSourcesPerRule = 100
 
-// policyConfig describes the policy the bouncer keeps on the netcup firewall.
+// policyConfig describes the DROP policy the bouncer keeps on the netcup firewall.
 type policyConfig struct {
-	// accept rules follow the DROP rules. Once the interface has a user policy, the
-	// implicit rule may switch to DROP_ALL, so these must allow everything that has to
-	// stay reachable.
-	accept        []scp.FirewallRule
 	dropProtocols []scp.FirewallProtocol
-	// maxRules is the budget of effective rules for the whole policy.
+	// maxRules is the budget of effective rules for the DROP policy.
 	maxRules   int
 	neverBlock []netip.Prefix
 }
 
-// defaultAcceptRules accept all traffic in both directions, which keeps the interface
-// behaving as with ACCEPT_ALL whatever the implicit rule becomes.
-func defaultAcceptRules() []scp.FirewallRule {
+// fallbackRules accept all traffic in both directions. They make up the fallback policy,
+// which keeps the interface behaving as with ACCEPT_ALL while the DROP policy is the only
+// user policy: attaching any user policy switches the implicit rules to DROP_ALL.
+func fallbackRules() []scp.FirewallRule {
 	var rules []scp.FirewallRule
 	for _, dir := range []scp.FirewallRuleDirection{scp.INGRESS, scp.EGRESS} {
 		for _, proto := range []scp.FirewallProtocol{scp.TCP, scp.UDP, scp.ICMP, scp.ICMPv6} {
@@ -42,57 +38,29 @@ func defaultAcceptRules() []scp.FirewallRule {
 	return rules
 }
 
-func loadAcceptRules(path string) ([]scp.FirewallRule, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var rules []scp.FirewallRule
-	if err := json.Unmarshal(b, &rules); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	if len(rules) == 0 {
-		return nil, fmt.Errorf("%s: no rules", path)
-	}
-	for i, r := range rules {
-		if !r.Direction.Valid() || !r.Protocol.Valid() || r.Action != scp.ACCEPT {
-			return nil, fmt.Errorf("%s: rule %d: need a valid direction and protocol, and action ACCEPT", path, i)
-		}
-	}
-	return rules, nil
-}
-
-// ruleCost is how many effective rules netcup counts for r: one per source and
-// destination address.
-func ruleCost(r scp.FirewallRule) int {
-	return max(1, lenPtr(r.Sources)) * max(1, lenPtr(r.Destinations))
-}
-
-// maxBlocked is how many prefixes fit into the DROP rules.
+// maxBlocked is how many prefixes fit into the DROP rules. netcup counts every source
+// address of a rule as one rule.
 func (c policyConfig) maxBlocked() int {
-	budget := c.maxRules
-	for _, r := range c.accept {
-		budget -= ruleCost(r)
-	}
-	return max(0, budget/len(c.dropProtocols))
+	return c.maxRules / len(c.dropProtocols)
 }
 
 type policyStats struct {
 	active, blocked, dropped int
 }
 
-// buildRules returns the policy rules: DROP rules for the bans first, then the ACCEPT
-// rules. bans must be ordered by priority; the ones beyond the budget are left out.
+// buildRules returns the DROP rules for the bans. bans must be ordered by priority; the
+// ones beyond the budget are left out. With acceptOnly, it returns no rules, and no ban
+// counts as over budget.
 func buildRules(c policyConfig, bans []ban, acceptOnly bool) ([]scp.FirewallRule, policyStats) {
 	st := policyStats{active: len(bans)}
-	// With acceptOnly, blocking nothing is the point; no ban is over budget.
 	if acceptOnly {
-		bans = nil
-	} else if n := c.maxBlocked(); len(bans) > n {
-		st.dropped = len(bans) - n
+		return nil, st
+	}
+	if n := c.maxBlocked(); len(bans) > n {
 		bans = bans[:n]
 	}
 	st.blocked = len(bans)
+	st.dropped = st.active - st.blocked
 
 	prefixes := make([]netip.Prefix, len(bans))
 	for i, b := range bans {
@@ -117,7 +85,7 @@ func buildRules(c policyConfig, bans []ban, acceptOnly bool) ([]scp.FirewallRule
 			})
 		}
 	}
-	return append(rules, c.accept...), st
+	return rules, st
 }
 
 // prefixString writes a single address without its prefix length.
@@ -186,10 +154,3 @@ func redactRules(rules []scp.FirewallRule) []scp.FirewallRule {
 }
 
 func ptr[T any](v T) *T { return &v }
-
-func lenPtr[T any](s *[]T) int {
-	if s == nil {
-		return 0
-	}
-	return len(*s)
-}

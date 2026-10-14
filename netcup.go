@@ -127,46 +127,37 @@ func (n *netcupFirewall) getFirewall(ctx context.Context) (*scp.ServerFirewall, 
 	return resp.JSON200, nil
 }
 
-// ensureAssigned attaches the policy to the interface, ahead of the other user policies.
-// The PUT replaces the whole assignment, so it sends the existing user and copied
-// policies along. It reports whether it changed the assignment.
-func (n *netcupFirewall) ensureAssigned(ctx context.Context, policyID int32) (bool, error) {
-	fw, err := n.getFirewall(ctx)
-	if err != nil {
-		return false, err
+// policyIDs returns the IDs of ps, in order.
+func policyIDs(ps *[]scp.FirewallPolicy) []int32 {
+	var ids []int32
+	for _, p := range deref(ps) {
+		if p.Id != nil {
+			ids = append(ids, *p.Id)
+		}
 	}
+	return ids
+}
+
+// putAssignment replaces the user policies of the interface with userPolicies, in order.
+// The PUT replaces the whole assignment, so it sends the copied policies and the active
+// flag of fw along.
+func (n *netcupFirewall) putAssignment(ctx context.Context, fw *scp.ServerFirewall, userPolicies []int32) error {
 	save := scp.ServerFirewallSave{
 		Active:         fw.Active,
-		UserPolicies:   []scp.IdentifierInt{{Id: policyID}},
+		UserPolicies:   []scp.IdentifierInt{},
 		CopiedPolicies: []scp.IdentifierInt{},
 	}
-	assigned := false
-	for _, p := range deref(fw.UserPolicies) {
-		if p.Id == nil {
-			continue
-		}
-		if *p.Id == policyID {
-			assigned = true
-			continue
-		}
-		save.UserPolicies = append(save.UserPolicies, scp.IdentifierInt{Id: *p.Id})
+	for _, id := range userPolicies {
+		save.UserPolicies = append(save.UserPolicies, scp.IdentifierInt{Id: id})
 	}
-	if assigned {
-		return false, nil
-	}
-	for _, p := range deref(fw.CopiedPolicies) {
-		if p.Id != nil {
-			save.CopiedPolicies = append(save.CopiedPolicies, scp.IdentifierInt{Id: *p.Id})
-		}
+	for _, id := range policyIDs(fw.CopiedPolicies) {
+		save.CopiedPolicies = append(save.CopiedPolicies, scp.IdentifierInt{Id: id})
 	}
 	resp, err := n.api.PutApiV1ServersServerIdInterfacesMacFirewallWithResponse(ctx, n.serverID, n.mac, save)
 	if err != nil {
-		return false, fmt.Errorf("netcup assign policy: %w", err)
+		return fmt.Errorf("netcup assign policies: %w", err)
 	}
-	if err := checkResponse("assign policy", resp.HTTPResponse, resp.Body, http.StatusOK, http.StatusAccepted); err != nil {
-		return false, err
-	}
-	return true, nil
+	return checkResponse("assign policies", resp.HTTPResponse, resp.Body, http.StatusOK, http.StatusAccepted)
 }
 
 func deref[T any](s *[]T) []T {

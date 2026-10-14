@@ -5,11 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -18,145 +17,114 @@ import (
 	"github.com/pr0ton11/netcup-scp-go/scp"
 )
 
-func TestParseBan(t *testing.T) {
-	now := time.Unix(1000, 0)
-	tests := []struct {
-		d    lapiDecision
-		want string
-		err  bool
-	}{
-		{lapiDecision{Type: "ban", Scope: "Ip", Value: "203.0.113.7", Duration: "4h"}, "203.0.113.7/32", false},
-		{lapiDecision{Type: "ban", Scope: "Ip", Value: "::ffff:203.0.113.7", Duration: "4h"}, "203.0.113.7/32", false},
-		{lapiDecision{Type: "ban", Scope: "Range", Value: "198.51.100.9/24", Duration: "1h"}, "198.51.100.0/24", false},
-		{lapiDecision{Type: "ban", Scope: "Ip", Value: "2001:db8::1", Duration: "1h"}, "2001:db8::1/128", false},
-		{lapiDecision{Type: "captcha", Scope: "Ip", Value: "203.0.113.7", Duration: "4h"}, "", true},
-		{lapiDecision{Type: "ban", Scope: "Country", Value: "CH", Duration: "4h"}, "", true},
-		{lapiDecision{Type: "ban", Scope: "Ip", Value: "nope", Duration: "4h"}, "", true},
-	}
-	for _, tt := range tests {
-		b, err := parseBan(tt.d, now)
-		if (err != nil) != tt.err {
-			t.Errorf("%+v: err = %v", tt.d, err)
-			continue
-		}
-		if err == nil && b.prefix.String() != tt.want {
-			t.Errorf("%+v: got %s, want %s", tt.d, b.prefix, tt.want)
-		}
-	}
-}
+const (
+	testUser   = 1001
+	testServer = 2002
+	testMAC    = "02:00:00:00:00:01"
+	testCopied = 3003
+)
 
-func TestDecisionSet(t *testing.T) {
-	now := time.Unix(1000, 0)
-	s := newDecisionSet()
-	s.apply(&streamResponse{New: []lapiDecision{
-		{ID: 1, Type: "ban", Scope: "Ip", Value: "203.0.113.1", Duration: "1h"},
-		{ID: 2, Type: "ban", Scope: "Ip", Value: "203.0.113.1", Duration: "3h"}, // same IP, longer
-		{ID: 3, Type: "ban", Scope: "Ip", Value: "203.0.113.2", Duration: "2h"},
-		{ID: 4, Type: "ban", Scope: "Ip", Value: "192.0.2.10", Duration: "2h"},   // never block
-		{ID: 5, Type: "ban", Scope: "Ip", Value: "10.0.0.1", Duration: "2h"},     // private
-		{ID: 6, Type: "ban", Scope: "Range", Value: "0.0.0.0/0", Duration: "2h"}, // too wide
-		{ID: 7, Type: "ban", Scope: "Ip", Value: "203.0.113.3", Duration: "10m"},
-	}}, true, now)
-
-	never := []netip.Prefix{netip.MustParsePrefix("192.0.2.10/32")}
-	got := prefixes(s.active(now, never))
-	if want := "203.0.113.1/32 203.0.113.2/32 203.0.113.3/32"; got != want {
-		t.Fatalf("active = %s, want %s", got, want)
-	}
-
-	// Expiry and deletion both remove entries.
-	s.apply(&streamResponse{Deleted: []lapiDecision{{ID: 3}}}, false, now)
-	if got, want := prefixes(s.active(now.Add(30*time.Minute), never)), "203.0.113.1/32"; got != want {
-		t.Fatalf("after delete/expiry = %s, want %s", got, want)
-	}
-	if _, ok := s.byID[7]; ok {
-		t.Error("expired decision still held")
-	}
-
-	// A startup pull replaces the set.
-	s.apply(&streamResponse{New: []lapiDecision{{ID: 9, Type: "ban", Scope: "Ip", Value: "198.51.100.1", Duration: "1h"}}}, true, now)
-	if got, want := prefixes(s.active(now, never)), "198.51.100.1/32"; got != want {
-		t.Fatalf("after startup = %s, want %s", got, want)
-	}
-}
-
-func prefixes(bans []ban) string {
-	var s []string
-	for _, b := range bans {
-		s = append(s, b.prefix.String())
-	}
-	return strings.Join(s, " ")
-}
-
-func TestBuildRules(t *testing.T) {
-	cfg := policyConfig{
-		accept:        defaultAcceptRules(),
-		dropProtocols: []scp.FirewallProtocol{scp.TCP, scp.UDP},
-		maxRules:      8 + 2*150, // room for 150 addresses
-	}
-	now := time.Unix(1000, 0)
-	var bans []ban
-	for i := range 200 {
-		bans = append(bans, ban{
-			prefix:  netip.PrefixFrom(netip.AddrFrom4([4]byte{203, 0, byte(i / 256), byte(i)}), 32),
-			expires: now.Add(time.Duration(200-i) * time.Minute), // earlier ones last longer
-		})
-	}
-	rules, st := buildRules(cfg, bans, false)
-	if st.active != 200 || st.blocked != 150 || st.dropped != 50 {
-		t.Fatalf("stats = %+v", st)
-	}
-	// TCP 100 + 50, UDP 100 + 50, then the 8 ACCEPT rules.
-	if len(rules) != 4+8 {
-		t.Fatalf("got %d rules", len(rules))
-	}
-	cost := 0
-	for i, r := range rules {
-		cost += ruleCost(r)
-		if i < 4 && (r.Action != scp.DROP || r.Direction != scp.INGRESS) {
-			t.Errorf("rule %d: want INGRESS DROP, got %s %s", i, r.Direction, r.Action)
-		}
-		if i >= 4 && r.Action != scp.ACCEPT {
-			t.Errorf("rule %d: want ACCEPT, got %s", i, r.Action)
-		}
-	}
-	if cost > cfg.maxRules {
-		t.Errorf("cost %d over budget %d", cost, cfg.maxRules)
-	}
-	// The longest-lasting bans are kept: 203.0.0.0 .. 203.0.0.149.
-	src := *rules[1].Sources
-	if src[len(src)-1] != "203.0.0.149" || (*rules[0].Sources)[0] != "203.0.0.0" {
-		t.Errorf("wrong selection: first %s, last %s", (*rules[0].Sources)[0], src[len(src)-1])
-	}
-
-	rules, st = buildRules(cfg, bans, true)
-	if len(rules) != 8 || st != (policyStats{active: 200}) {
-		t.Fatalf("accept only: %d rules, %+v", len(rules), st)
-	}
-}
-
-func TestRulesEqualNormalizes(t *testing.T) {
-	a := []scp.FirewallRule{{Direction: scp.INGRESS, Protocol: scp.TCP, Action: scp.DROP, Sources: &[]string{"203.0.113.2", "203.0.113.1"}}}
-	b := []scp.FirewallRule{{Direction: scp.INGRESS, Protocol: scp.TCP, Action: scp.DROP, Sources: &[]string{"203.0.113.1/32", "203.0.113.2"},
-		NumberOfEffectiveRules: ptr[int32](2), DestinationPorts: ptr(""), Destinations: &[]string{}}}
-	if !rulesEqual(a, b) {
-		t.Error("equal rules compare different")
-	}
-	b[0].Action = scp.ACCEPT
-	if rulesEqual(a, b) {
-		t.Error("different rules compare equal")
-	}
-}
-
-// fakeSCP serves the parts of the SCP API the bouncer uses.
+// fakeSCP serves the parts of the SCP API the bouncer uses. Like netcup, it switches the
+// implicit rules to DROP_ALL while any user policy is attached. After every change it
+// checks that an interface without foreign user policies still accepts ordinary traffic.
 type fakeSCP struct {
+	t        testing.TB
 	mu       sync.Mutex
 	policies map[int32]scp.FirewallPolicy
+	foreign  map[int32]bool // policies of the user, not the bouncer's
 	nextID   int32
-	firewall scp.ServerFirewall
-	puts     int
-	assigns  []scp.ServerFirewallSave
-	status   int // if set, policy writes fail with it
+	user     []int32 // attached user policies, in order
+	ops      []string
+	status   int  // if set, policy writes fail with it
+	lenient  bool // skip the reachability check (while simulating the user's own edits)
+}
+
+func newFakeSCP(t testing.TB) *fakeSCP {
+	return &fakeSCP{t: t, policies: map[int32]scp.FirewallPolicy{}, foreign: map[int32]bool{}, nextID: 500}
+}
+
+func (f *fakeSCP) addPolicy(name string, rules []scp.FirewallRule, foreign bool) int32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	f.policies[f.nextID] = scp.FirewallPolicy{Id: ptr(f.nextID), Name: ptr(name), Rules: &rules}
+	f.foreign[f.nextID] = foreign
+	return f.nextID
+}
+
+func (f *fakeSCP) attach(ids ...int32) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.user = ids
+}
+
+func (f *fakeSCP) setRules(id int32, rules []scp.FirewallRule) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.policies[id]
+	p.Rules = &rules
+	f.policies[id] = p
+}
+
+func (f *fakeSCP) attached() []int32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.user)
+}
+
+func (f *fakeSCP) rules(id int32) []scp.FirewallRule {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return deref(f.policies[id].Rules)
+}
+
+func (f *fakeSCP) byName(name string) int32 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, p := range f.policies {
+		if *p.Name == name {
+			return id
+		}
+	}
+	return 0
+}
+
+func (f *fakeSCP) implicit() scp.ImplicitRule {
+	if len(f.user) > 0 {
+		return scp.DROPALL
+	}
+	return scp.ACCEPTALL
+}
+
+// checkReachable fails the test if ordinary traffic (no banned source) would be dropped
+// although none of the user's own policies is attached.
+func (f *fakeSCP) checkReachable(after string) {
+	if f.lenient {
+		return
+	}
+	for _, id := range f.user {
+		if f.foreign[id] {
+			return
+		}
+	}
+	for _, dir := range []scp.FirewallRuleDirection{scp.INGRESS, scp.EGRESS} {
+		action := scp.FirewallAction("")
+	policies:
+		for _, id := range f.user {
+			for _, r := range deref(f.policies[id].Rules) {
+				if r.Direction == dir && r.Protocol == scp.TCP && len(deref(r.Sources)) == 0 {
+					action = r.Action
+					break policies
+				}
+			}
+		}
+		if action == "" && f.implicit() == scp.ACCEPTALL {
+			action = scp.ACCEPT
+		}
+		if action != scp.ACCEPT {
+			f.t.Errorf("after %s: %s TCP traffic is dropped (attached %v)", after, dir, f.user)
+		}
+	}
 }
 
 func (f *fakeSCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -167,12 +135,12 @@ func (f *fakeSCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(code)
 		json.NewEncoder(w).Encode(v)
 	}
-	const base = "/api/v1/users/1001/firewall-policies"
-	fwPath := "/api/v1/servers/2002/interfaces/02:00:00:00:00:01/firewall"
+	base := fmt.Sprintf("/api/v1/users/%d/firewall-policies", testUser)
+	fwPath := fmt.Sprintf("/api/v1/servers/%d/interfaces/%s/firewall", testServer, testMAC)
 	var id int32
 	switch {
 	case r.URL.Path == base && r.Method == http.MethodGet:
-		var list []scp.FirewallPolicy
+		list := []scp.FirewallPolicy{}
 		for _, p := range f.policies {
 			if strings.Contains(*p.Name, r.URL.Query().Get("q")) {
 				list = append(list, scp.FirewallPolicy{Id: p.Id, Name: p.Name})
@@ -185,6 +153,7 @@ func (f *fakeSCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.nextID++
 		p := scp.FirewallPolicy{Id: ptr(f.nextID), Name: &s.Name, Description: s.Description, Rules: s.Rules}
 		f.policies[f.nextID] = p
+		f.ops = append(f.ops, "create "+s.Name)
 		reply(201, p)
 	case func() bool { _, err := fmt.Sscanf(r.URL.Path, base+"/%d", &id); return err == nil }():
 		p, ok := f.policies[id]
@@ -205,20 +174,34 @@ func (f *fakeSCP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			json.NewDecoder(r.Body).Decode(&s)
 			p.Rules = s.Rules
 			f.policies[id] = p
-			f.puts++
+			f.ops = append(f.ops, fmt.Sprintf("put %s (%d rules)", *p.Name, len(deref(s.Rules))))
+			f.checkReachable(f.ops[len(f.ops)-1])
 			reply(202, scp.FirewallPolicyUpdateResult{FirewallPolicy: &p})
 		}
 	case r.URL.Path == fwPath && r.Method == http.MethodGet:
-		reply(200, f.firewall)
+		var ups []scp.FirewallPolicy
+		for _, id := range f.user {
+			ups = append(ups, f.policies[id])
+		}
+		reply(200, scp.ServerFirewall{
+			Active:              ptr(true),
+			UserPolicies:        &ups,
+			CopiedPolicies:      &[]scp.FirewallPolicy{{Id: ptr[int32](testCopied)}},
+			IngressImplicitRule: ptr(f.implicit()),
+			EgressImplicitRule:  ptr(f.implicit()),
+		})
 	case r.URL.Path == fwPath && r.Method == http.MethodPut:
 		var s scp.ServerFirewallSave
 		json.NewDecoder(r.Body).Decode(&s)
-		f.assigns = append(f.assigns, s)
-		var ups []scp.FirewallPolicy
-		for _, i := range s.UserPolicies {
-			ups = append(ups, scp.FirewallPolicy{Id: ptr(i.Id)})
+		if s.Active == nil || !*s.Active || len(s.CopiedPolicies) != 1 || s.CopiedPolicies[0].Id != testCopied {
+			f.t.Errorf("assignment dropped the copied policy or active: %+v", s)
 		}
-		f.firewall.UserPolicies = &ups
+		f.user = nil
+		for _, i := range s.UserPolicies {
+			f.user = append(f.user, i.Id)
+		}
+		f.ops = append(f.ops, fmt.Sprintf("assign %v", f.user))
+		f.checkReachable(f.ops[len(f.ops)-1])
 		reply(202, scp.TaskInfo{})
 	default:
 		reply(404, map[string]string{"message": r.Method + " " + r.URL.Path})
@@ -230,6 +213,12 @@ type fakeLAPI struct {
 	mu       sync.Mutex
 	queue    []streamResponse
 	startups int
+}
+
+func (f *fakeLAPI) push(sr streamResponse) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queue = append(f.queue, sr)
 }
 
 func (f *fakeLAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -249,152 +238,269 @@ func (f *fakeLAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(sr)
 }
 
-func TestBouncerEndToEnd(t *testing.T) {
-	scpFake := &fakeSCP{policies: map[int32]scp.FirewallPolicy{}, nextID: 500, firewall: scp.ServerFirewall{
-		Active:              ptr(true),
-		CopiedPolicies:      &[]scp.FirewallPolicy{{Id: ptr[int32](3003)}},
-		IngressImplicitRule: ptr(scp.ACCEPTALL),
-	}}
-	scpSrv := httptest.NewServer(scpFake)
-	defer scpSrv.Close()
-	lapiFake := &fakeLAPI{queue: []streamResponse{
-		{New: []lapiDecision{{ID: 1, Type: "ban", Scope: "Ip", Value: "203.0.113.1", Duration: "1h"}}},
-		{},
-		{New: []lapiDecision{{ID: 2, Type: "ban", Scope: "Ip", Value: "2001:db8::1", Duration: "3h"}}},
-	}}
-	lapiSrv := httptest.NewServer(lapiFake)
-	defer lapiSrv.Close()
+func banned(id int64, ip, dur string) streamResponse {
+	return streamResponse{New: []lapiDecision{{ID: id, Type: "ban", Scope: "Ip", Value: ip, Duration: dur}}}
+}
 
+type harness struct {
+	scp  *fakeSCP
+	lapi *fakeLAPI
+	logs *bytes.Buffer
+	cfg  bouncerConfig
+	fw   *netcupFirewall
+	lc   *lapiClient
+}
+
+func newHarness(t *testing.T) *harness {
+	h := &harness{scp: newFakeSCP(t), lapi: &fakeLAPI{}, logs: &bytes.Buffer{}}
+	scpSrv := httptest.NewServer(h.scp)
+	t.Cleanup(scpSrv.Close)
+	lapiSrv := httptest.NewServer(h.lapi)
+	t.Cleanup(lapiSrv.Close)
 	api, err := scp.NewClientWithResponses(scpSrv.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	logs := &bytes.Buffer{}
-	b := newBouncer(bouncerConfig{
-		policyName: "crowdsec-bouncer",
-		policy: policyConfig{
-			accept: defaultAcceptRules(), dropProtocols: []scp.FirewallProtocol{scp.TCP, scp.UDP}, maxRules: 400,
-		},
+	h.fw = &netcupFirewall{api: api, userID: testUser, serverID: testServer, mac: testMAC}
+	h.lc = &lapiClient{baseURL: lapiSrv.URL, apiKey: "key", http: http.DefaultClient}
+	h.cfg = bouncerConfig{
+		policyName:   "crowdsec-bouncer",
+		policy:       policyConfig{dropProtocols: []scp.FirewallProtocol{scp.TCP, scp.UDP}, maxRules: 400},
 		syncInterval: 2 * time.Minute,
 		driftCheck:   time.Hour,
-	},
-		&lapiClient{baseURL: lapiSrv.URL, apiKey: "key", http: http.DefaultClient},
-		&netcupFirewall{api: api, userID: 1001, serverID: 2002, mac: "02:00:00:00:00:01"},
-		slog.New(slog.NewJSONHandler(logs, nil)))
+		clearOnExit:  true,
+	}
+	return h
+}
 
-	ctx := context.Background()
-	now := time.Now()
+func (h *harness) bouncer() *bouncer {
+	return newBouncer(h.cfg, h.lc, h.fw, slog.New(slog.NewJSONHandler(h.logs, nil)))
+}
 
-	// First step: creates the policy with the ban and assigns it, keeping the copied policy.
+// sources summarizes the DROP rules as "PROTO:addr,addr".
+func sources(rules []scp.FirewallRule) []string {
+	var out []string
+	for _, r := range rules {
+		if r.Action == scp.DROP {
+			out = append(out, string(r.Protocol)+":"+strings.Join(deref(r.Sources), ","))
+		}
+	}
+	return out
+}
+
+func TestNoUserPolicies(t *testing.T) {
+	h := newHarness(t)
+	h.lapi.push(banned(1, "203.0.113.1", "1h"))
+	b := h.bouncer()
+	ctx, now := context.Background(), time.Now()
+
+	// First step: creates the DROP policy with the ban and the fallback, attaches both.
 	b.step(ctx, now)
-	if len(scpFake.policies) != 1 || len(scpFake.assigns) != 1 {
-		t.Fatalf("policies %d, assigns %d", len(scpFake.policies), len(scpFake.assigns))
+	drop, fallback := h.scp.byName("crowdsec-bouncer"), h.scp.byName("crowdsec-bouncer-fallback")
+	if got, want := h.scp.attached(), []int32{drop, fallback}; !slices.Equal(got, want) {
+		t.Fatalf("attached %v, want %v", got, want)
 	}
-	as := scpFake.assigns[0]
-	if len(as.UserPolicies) != 1 || as.UserPolicies[0].Id != 501 || len(as.CopiedPolicies) != 1 || as.CopiedPolicies[0].Id != 3003 || !*as.Active {
-		t.Fatalf("assignment = %+v", as)
+	if got := sources(h.scp.rules(drop)); len(h.scp.rules(drop)) != 2 || !slices.Equal(got, []string{"TCP:203.0.113.1", "UDP:203.0.113.1"}) {
+		t.Fatalf("DROP policy = %v", h.scp.rules(drop))
 	}
-	p := scpFake.policies[501]
-	if r := (*p.Rules)[0]; r.Action != scp.DROP || (*r.Sources)[0] != "203.0.113.1" {
-		t.Fatalf("first rule = %+v", r)
+	if !rulesEqual(h.scp.rules(fallback), fallbackRules()) {
+		t.Fatalf("fallback = %v", h.scp.rules(fallback))
 	}
 	// The firewall state is logged as values, not pointers.
-	if l := logs.String(); !strings.Contains(l, `"active":true,"ingress_implicit":"ACCEPT_ALL","egress_implicit":""`) {
+	if l := h.logs.String(); !strings.Contains(l, `"active":true,"ingress_implicit":"DROP_ALL","egress_implicit":"DROP_ALL"`) {
 		t.Errorf("firewall log line missing values:\n%s", l)
 	}
 
-	// Nothing changed: no write.
+	// Nothing changed: no write. A new ban within the sync interval waits.
+	ops := len(h.scp.ops)
 	b.step(ctx, now.Add(30*time.Second))
-	if scpFake.puts != 0 {
-		t.Fatalf("puts = %d, want 0", scpFake.puts)
-	}
-
-	// A new ban within the sync interval waits, then gets written.
+	h.lapi.push(banned(2, "2001:db8::1", "3h"))
 	b.step(ctx, now.Add(time.Minute))
-	if scpFake.puts != 0 {
-		t.Fatalf("wrote within sync interval")
+	if len(h.scp.ops) != ops {
+		t.Fatalf("wrote too early: %v", h.scp.ops[ops:])
 	}
 	b.step(ctx, now.Add(3*time.Minute))
-	if scpFake.puts != 1 || len(*scpFake.policies[501].Rules) != 2+8 {
-		t.Fatalf("puts = %d, rules = %d", scpFake.puts, len(*scpFake.policies[501].Rules))
+	if got := sources(h.scp.rules(drop)); len(got) != 2 || !strings.Contains(got[0], "2001:db8::1") {
+		t.Fatalf("DROP rules = %v", got)
 	}
 
-	// The IPv4 ban expires after an hour and is removed; the drift check finds no change.
+	// The IPv4 ban expires after an hour.
 	b.step(ctx, now.Add(61*time.Minute))
-	rules := *scpFake.policies[501].Rules
-	if scpFake.puts != 2 || len(rules) != 2+8 || (*rules[0].Sources)[0] != "2001:db8::1" || len(*rules[0].Sources) != 1 {
-		t.Fatalf("after expiry: puts %d, rules %+v", scpFake.puts, rules)
-	}
-	if len(scpFake.assigns) != 1 {
-		t.Fatalf("reassigned although still assigned")
+	if got := sources(h.scp.rules(drop)); !slices.Equal(got, []string{"TCP:2001:db8::1", "UDP:2001:db8::1"}) {
+		t.Fatalf("after expiry: %v", got)
 	}
 
-	// A change by hand is found by the drift check and overwritten.
-	scpFake.mu.Lock()
-	p = scpFake.policies[501]
-	p.Rules = &[]scp.FirewallRule{}
-	scpFake.policies[501] = p
-	scpFake.mu.Unlock()
+	// Changes by hand to either policy are found by the drift check and overwritten.
+	h.scp.lenient = true
+	h.scp.setRules(drop, nil)
+	h.scp.setRules(fallback, nil)
 	b.step(ctx, now.Add(125*time.Minute))
-	if scpFake.puts != 3 || len(*scpFake.policies[501].Rules) != 2+8 {
-		t.Fatalf("drift not corrected: puts %d", scpFake.puts)
+	h.scp.lenient = false
+	if len(h.scp.rules(drop)) != 2 || !rulesEqual(h.scp.rules(fallback), fallbackRules()) {
+		t.Fatalf("drift not corrected: drop %d, fallback %d rules", len(h.scp.rules(drop)), len(h.scp.rules(fallback)))
 	}
 
 	// Rate limited: backs off for Retry-After.
-	scpFake.status = http.StatusTooManyRequests
+	h.scp.status = http.StatusTooManyRequests
 	b.step(ctx, now.Add(200*time.Minute)) // the IPv6 ban has expired by now
 	if b.backoff != 2*time.Minute {
 		t.Fatalf("backoff = %s, want 2m", b.backoff)
 	}
-	scpFake.status = 0
+	h.scp.status = 0
 	b.step(ctx, now.Add(201*time.Minute))
-	if scpFake.puts != 3 {
-		t.Fatalf("wrote during backoff")
+	if len(h.scp.rules(drop)) != 2 {
+		t.Fatal("wrote during backoff")
 	}
 	b.step(ctx, now.Add(203*time.Minute))
-	if scpFake.puts != 4 || len(*scpFake.policies[501].Rules) != 8 {
-		t.Fatalf("after backoff: puts %d, rules %d", scpFake.puts, len(*scpFake.policies[501].Rules))
+	if len(h.scp.rules(drop)) != 0 {
+		t.Fatalf("after backoff: %d rules", len(h.scp.rules(drop)))
 	}
 
-	// Restart: finds the existing policy instead of creating a second one.
-	lapiFake.queue = []streamResponse{{New: []lapiDecision{{ID: 3, Type: "ban", Scope: "Ip", Value: "198.51.100.5", Duration: "1h"}}}}
-	b2 := newBouncer(b.cfg, b.lapi, b.fw, b.log)
+	// Restart: finds both policies instead of creating new ones.
+	h.lapi.push(banned(3, "198.51.100.5", "1h"))
+	b2 := h.bouncer()
 	b2.step(ctx, now)
-	if len(scpFake.policies) != 1 || scpFake.puts != 5 || lapiFake.startups != 2 {
-		t.Fatalf("restart: policies %d, puts %d, startups %d", len(scpFake.policies), scpFake.puts, lapiFake.startups)
+	if len(h.scp.policies) != 2 || h.lapi.startups != 2 || len(h.scp.rules(drop)) != 2 {
+		t.Fatalf("restart: %d policies, %d startups, %d rules", len(h.scp.policies), h.lapi.startups, len(h.scp.rules(drop)))
+	}
+	if got, want := h.scp.attached(), []int32{drop, fallback}; !slices.Equal(got, want) {
+		t.Fatalf("restart: attached %v, want %v", got, want)
+	}
+}
+
+func TestForeignUserPolicies(t *testing.T) {
+	h := newHarness(t)
+	ssh := h.scp.addPolicy("ssh from office", []scp.FirewallRule{
+		{Direction: scp.INGRESS, Protocol: scp.TCP, Action: scp.ACCEPT, DestinationPorts: ptr("22"), Sources: &[]string{"198.51.100.0/24"}},
+	}, true)
+	web := h.scp.addPolicy("web", []scp.FirewallRule{
+		{Direction: scp.INGRESS, Protocol: scp.TCP, Action: scp.ACCEPT, DestinationPorts: ptr("443")},
+	}, true)
+	h.scp.attach(ssh, web)
+	h.lapi.push(banned(1, "203.0.113.1", "1h"))
+	b := h.bouncer()
+	b.step(context.Background(), time.Now())
+
+	drop := h.scp.byName("crowdsec-bouncer")
+	if got, want := h.scp.attached(), []int32{drop, ssh, web}; !slices.Equal(got, want) {
+		t.Fatalf("attached %v, want %v", got, want)
+	}
+	if h.scp.byName("crowdsec-bouncer-fallback") != 0 {
+		t.Error("created a fallback although the user has policies")
+	}
+	if len(h.scp.rules(ssh)) != 1 || len(h.scp.rules(web)) != 1 {
+		t.Error("changed the user's policies")
+	}
+}
+
+func TestForeignPolicyAppearsLater(t *testing.T) {
+	h := newHarness(t)
+	h.lapi.push(banned(1, "203.0.113.1", "4h"))
+	b := h.bouncer()
+	ctx, now := context.Background(), time.Now()
+	b.step(ctx, now)
+	drop, fallback := h.scp.byName("crowdsec-bouncer"), h.scp.byName("crowdsec-bouncer-fallback")
+
+	// The user attaches a policy of their own, wherever the SCP puts it.
+	mine := h.scp.addPolicy("mine", []scp.FirewallRule{{Direction: scp.INGRESS, Protocol: scp.TCP, Action: scp.ACCEPT}}, true)
+	h.scp.attach(mine, drop, fallback)
+	b.step(ctx, now.Add(61*time.Minute))
+	if got, want := h.scp.attached(), []int32{drop, mine}; !slices.Equal(got, want) {
+		t.Fatalf("attached %v, want %v", got, want)
 	}
 
-	// Exit clears the DROP rules.
-	b2.clear()
-	if len(*scpFake.policies[501].Rules) != 8 {
-		t.Fatalf("clear left %d rules", len(*scpFake.policies[501].Rules))
+	// And detaches it again: the fallback comes back.
+	h.scp.lenient = true // the user's own detach drops traffic until the bouncer acts
+	h.scp.attach(drop)
+	h.scp.lenient = false
+	b.step(ctx, now.Add(122*time.Minute))
+	if got, want := h.scp.attached(), []int32{drop, fallback}; !slices.Equal(got, want) {
+		t.Fatalf("attached %v, want %v", got, want)
+	}
+	if len(h.scp.policies) != 3 {
+		t.Errorf("%d policies, want 3 (no second fallback)", len(h.scp.policies))
+	}
+}
+
+func TestClearOnExit(t *testing.T) {
+	h := newHarness(t)
+	h.lapi.push(banned(1, "203.0.113.1", "1h"))
+	b := h.bouncer()
+	b.step(context.Background(), time.Now())
+	drop, fallback := h.scp.byName("crowdsec-bouncer"), h.scp.byName("crowdsec-bouncer-fallback")
+
+	b.clear()
+	if n := len(h.scp.rules(drop)); n != 0 {
+		t.Fatalf("DROP policy has %d rules after clear", n)
+	}
+	if got, want := h.scp.attached(), []int32{drop, fallback}; !slices.Equal(got, want) {
+		t.Fatalf("attached %v, want %v", got, want)
+	}
+	if !rulesEqual(h.scp.rules(fallback), fallbackRules()) {
+		t.Error("clear changed the fallback")
+	}
+}
+
+func TestMigrationFromV010(t *testing.T) {
+	h := newHarness(t)
+	// v0.1.0: one policy, DROP rules followed by the accept-all rules, attached alone.
+	old := append([]scp.FirewallRule{
+		{Direction: scp.INGRESS, Protocol: scp.TCP, Action: scp.DROP, Sources: &[]string{"192.0.2.99"}},
+	}, fallbackRules()...)
+	drop := h.scp.addPolicy("crowdsec-bouncer", old, false)
+	h.scp.attach(drop)
+	h.lapi.push(banned(1, "203.0.113.1", "1h"))
+	b := h.bouncer()
+	ctx, now := context.Background(), time.Now()
+
+	// First step: create and attach the fallback; the old policy keeps its accept rules.
+	b.step(ctx, now)
+	fallback := h.scp.byName("crowdsec-bouncer-fallback")
+	if got, want := h.scp.attached(), []int32{drop, fallback}; !slices.Equal(got, want) {
+		t.Fatalf("attached %v, want %v", got, want)
+	}
+	if len(h.scp.rules(drop)) != len(old) {
+		t.Fatal("stripped the accept rules before the fallback was attached")
+	}
+
+	// Next step: the DROP policy is rewritten to DROP rules only.
+	b.step(ctx, now.Add(30*time.Second))
+	if got := sources(h.scp.rules(drop)); len(h.scp.rules(drop)) != 2 || !slices.Equal(got, []string{"TCP:203.0.113.1", "UDP:203.0.113.1"}) {
+		t.Fatalf("after migration: %v", h.scp.rules(drop))
+	}
+	want := []string{
+		"create crowdsec-bouncer-fallback",
+		fmt.Sprintf("assign [%d %d]", drop, fallback),
+		"put crowdsec-bouncer (2 rules)",
+	}
+	if !slices.Equal(h.scp.ops, want) {
+		t.Fatalf("ops = %q, want %q", h.scp.ops, want)
+	}
+	// checkReachable ran after every write; it fails the test if traffic was ever dropped.
+}
+
+func TestAcceptOnlyIsNotOverBudget(t *testing.T) {
+	h := newHarness(t)
+	h.cfg.acceptOnly = true
+	h.lapi.push(banned(1, "203.0.113.1", "1h"))
+	b := h.bouncer()
+	b.step(context.Background(), time.Now())
+	l := h.logs.String()
+	if !strings.Contains(l, `"active":1,"blocked":0,"over_budget":0`) || strings.Contains(l, "rule budget") {
+		t.Errorf("accept-only stats wrong:\n%s", l)
+	}
+	if n := len(h.scp.rules(h.scp.byName("crowdsec-bouncer"))); n != 0 {
+		t.Errorf("accept-only wrote %d DROP rules", n)
 	}
 }
 
 func TestNoWriteBeforeFirstPull(t *testing.T) {
-	lapiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }))
-	defer lapiSrv.Close()
-	scpFake := &fakeSCP{policies: map[int32]scp.FirewallPolicy{}}
-	scpSrv := httptest.NewServer(scpFake)
-	defer scpSrv.Close()
-	api, _ := scp.NewClientWithResponses(scpSrv.URL)
-	b := newBouncer(bouncerConfig{policyName: "x", policy: policyConfig{accept: defaultAcceptRules(), dropProtocols: []scp.FirewallProtocol{scp.TCP}, maxRules: 100}},
-		&lapiClient{baseURL: lapiSrv.URL, apiKey: "key", http: http.DefaultClient},
-		&netcupFirewall{api: api, userID: 1001, serverID: 2002, mac: "02:00:00:00:00:01"},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+	h := newHarness(t)
+	h.lc.apiKey = "wrong"
+	b := h.bouncer()
 	b.step(context.Background(), time.Now())
-	if len(scpFake.policies) != 0 {
-		t.Fatal("created a policy without decisions")
-	}
-}
-
-func TestLoadAcceptRulesExample(t *testing.T) {
-	rules, err := loadAcceptRules("deploy/accept-rules.example.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rules) != 10 || *rules[0].DestinationPorts != "22" {
-		t.Fatalf("got %d rules", len(rules))
+	if len(h.scp.ops) != 0 {
+		t.Fatalf("wrote without decisions: %v", h.scp.ops)
 	}
 }
 

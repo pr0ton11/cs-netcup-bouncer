@@ -73,11 +73,8 @@ func run(log *slog.Logger) error {
 	check(err)
 	cfg.policy.dropProtocols, err = envProtocols("NETCUP_DROP_PROTOCOLS", "TCP,UDP")
 	check(err)
-	if path := os.Getenv("NETCUP_ACCEPT_RULES_FILE"); path != "" {
-		cfg.policy.accept, err = loadAcceptRules(path)
-		check(err)
-	} else {
-		cfg.policy.accept = defaultAcceptRules()
+	if os.Getenv("NETCUP_ACCEPT_RULES_FILE") != "" {
+		check(errors.New("NETCUP_ACCEPT_RULES_FILE was removed in v0.1.1: the bouncer only adds DROP rules now; put your own ACCEPT rules in a policy of your own"))
 	}
 
 	apiKey := os.Getenv("CROWDSEC_LAPI_KEY")
@@ -114,11 +111,11 @@ func run(log *slog.Logger) error {
 		return errors.Join(errs...)
 	}
 	if n := cfg.policy.maxBlocked(); n == 0 {
-		return fmt.Errorf("NETCUP_MAX_RULES=%d leaves no room for DROP rules after the ACCEPT rules", cfg.policy.maxRules)
+		return fmt.Errorf("NETCUP_MAX_RULES=%d leaves no room for one address per drop protocol", cfg.policy.maxRules)
 	}
 
 	log.Info("starting", "version", version, "dry_run", cfg.dryRun, "accept_only", cfg.acceptOnly,
-		"policy", cfg.policyName, "accept_rules", len(cfg.policy.accept), "drop_protocols", fmt.Sprint(cfg.policy.dropProtocols),
+		"policy", cfg.policyName, "fallback_policy", cfg.fallbackName(), "drop_protocols", fmt.Sprint(cfg.policy.dropProtocols),
 		"max_blocked", cfg.policy.maxBlocked(), "never_block", len(cfg.policy.neverBlock))
 	return newBouncer(cfg, lapi, fw, log).run(ctx)
 }
