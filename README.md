@@ -13,21 +13,28 @@ Image: `ghcr.io/pr0ton11/cs-netcup-bouncer` (linux/amd64, linux/arm64, distroles
 
 ## Configuration
 
-| Variable | Default |
-|---|---|
-| `NETCUP_USER_ID`, `NETCUP_SERVER_ID`, `NETCUP_INTERFACE_MAC` | required |
-| `NETCUP_REFRESH_TOKEN_FILE` | `/run/secrets/netcup-refresh-token` |
-| `CROWDSEC_LAPI_URL` | `http://127.0.0.1:8080` |
-| `CROWDSEC_LAPI_KEY_FILE` (or `CROWDSEC_LAPI_KEY`) | `/run/secrets/netcup-bouncer-lapi-key` |
-| `NETCUP_POLICY_NAME` | `crowdsec-bouncer` |
-| `NETCUP_ACCEPT_RULES_FILE` | accept all (see `deploy/accept-rules.example.json`) |
-| `NETCUP_DROP_PROTOCOLS` | `TCP,UDP` |
-| `NETCUP_MAX_RULES` | `400` |
-| `NEVER_BLOCK` | comma-separated addresses or prefixes |
-| `POLL_INTERVAL`, `SYNC_INTERVAL`, `DRIFT_CHECK_INTERVAL` | `30s`, `2m`, `1h` |
-| `DRY_RUN`, `ACCEPT_ONLY`, `CLEAR_ON_EXIT`, `DEBUG` | `false`, `false`, `true`, `false` |
-
-`NETCUP_USER_ID` is the `id` claim printed by `go run github.com/pr0ton11/netcup-scp-go/cmd/scp-login`, not the customer number.
+| Variable | Default | Description |
+|---|---|---|
+| `NETCUP_USER_ID` | required | SCP user ID: the `id` claim printed by `go run github.com/pr0ton11/netcup-scp-go/cmd/scp-login`, not the customer number |
+| `NETCUP_SERVER_ID` | required | ID of the server in the SCP |
+| `NETCUP_INTERFACE_MAC` | required | MAC address of the server's public interface |
+| `NETCUP_REFRESH_TOKEN_FILE` | `/run/secrets/netcup-refresh-token` | File with the SCP offline refresh token; only read, never written |
+| `NETCUP_POLICY_NAME` | `crowdsec-bouncer` | Name of the firewall policy the bouncer creates and owns |
+| `NETCUP_ACCEPT_RULES_FILE` | accept all | JSON array of ACCEPT rules placed after the DROP rules (see `deploy/accept-rules.example.json`) |
+| `NETCUP_DROP_PROTOCOLS` | `TCP,UDP` | Protocols that get DROP rules for banned addresses |
+| `NETCUP_MAX_RULES` | `400` | Budget of effective rules for the policy (netcup allows 500 per policy and counts each address once) |
+| `NETCUP_API_URL` | `https://www.servercontrolpanel.de/scp-core` | Base URL of the SCP REST API |
+| `CROWDSEC_LAPI_URL` | `http://127.0.0.1:8080` | URL of the CrowdSec local API |
+| `CROWDSEC_LAPI_KEY_FILE` | `/run/secrets/netcup-bouncer-lapi-key` | File with the bouncer API key from `cscli bouncers add` |
+| `CROWDSEC_LAPI_KEY` | | Bouncer API key; overrides `CROWDSEC_LAPI_KEY_FILE` |
+| `NEVER_BLOCK` | | Comma-separated addresses or prefixes that are never blocked, such as the server's own |
+| `POLL_INTERVAL` | `30s` | How often to pull decisions from the LAPI |
+| `SYNC_INTERVAL` | `2m` | Minimum time between two policy writes |
+| `DRIFT_CHECK_INTERVAL` | `1h` | How often to read the policy and its assignment back and correct changes |
+| `ACCEPT_ONLY` | `false` | Write only the ACCEPT rules, for a safe first rollout |
+| `DRY_RUN` | `false` | Log the policy instead of calling netcup; needs no netcup credentials |
+| `CLEAR_ON_EXIT` | `true` | Remove the DROP rules on shutdown |
+| `DEBUG` | `false` | Log at debug level |
 
 ## Run
 
