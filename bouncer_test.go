@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -268,6 +269,7 @@ func TestBouncerEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	logs := &bytes.Buffer{}
 	b := newBouncer(bouncerConfig{
 		policyName: "crowdsec-bouncer",
 		policy: policyConfig{
@@ -278,7 +280,7 @@ func TestBouncerEndToEnd(t *testing.T) {
 	},
 		&lapiClient{baseURL: lapiSrv.URL, apiKey: "key", http: http.DefaultClient},
 		&netcupFirewall{api: api, userID: 1001, serverID: 2002, mac: "02:00:00:00:00:01"},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+		slog.New(slog.NewJSONHandler(logs, nil)))
 
 	ctx := context.Background()
 	now := time.Now()
@@ -295,6 +297,10 @@ func TestBouncerEndToEnd(t *testing.T) {
 	p := scpFake.policies[501]
 	if r := (*p.Rules)[0]; r.Action != scp.DROP || (*r.Sources)[0] != "203.0.113.1" {
 		t.Fatalf("first rule = %+v", r)
+	}
+	// The firewall state is logged as values, not pointers.
+	if l := logs.String(); !strings.Contains(l, `"active":true,"ingress_implicit":"ACCEPT_ALL","egress_implicit":""`) {
+		t.Errorf("firewall log line missing values:\n%s", l)
 	}
 
 	// Nothing changed: no write.

@@ -188,7 +188,9 @@ func (b *bouncer) reconcile(ctx context.Context, rules []scp.FirewallRule) error
 		b.log.Info("policy assigned to interface", "id", b.policyID, "server", b.fw.serverID, "mac", b.fw.mac)
 		if fw, err := b.fw.getFirewall(ctx); err == nil {
 			b.log.Info("firewall after assignment",
-				"active", fw.Active, "ingress_implicit", fw.IngressImplicitRule, "egress_implicit", fw.EgressImplicitRule,
+				"active", fw.Active != nil && *fw.Active,
+				"ingress_implicit", string(deref1(fw.IngressImplicitRule)),
+				"egress_implicit", string(deref1(fw.EgressImplicitRule)),
 				"user_policies", len(deref(fw.UserPolicies)), "copied_policies", len(deref(fw.CopiedPolicies)))
 		}
 	}
@@ -228,4 +230,12 @@ func (b *bouncer) save(rules []scp.FirewallRule) scp.FirewallPolicySave {
 		Description: ptr("Managed by crowdsec-netcup-bouncer. Changes are overwritten."),
 		Rules:       &rules,
 	}
+}
+
+func deref1[T any](p *T) T {
+	var zero T
+	if p == nil {
+		return zero
+	}
+	return *p
 }
