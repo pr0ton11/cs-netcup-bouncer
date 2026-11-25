@@ -1,7 +1,7 @@
 # Builds a static binary and runs it on distroless, as an unprivileged user.
 # Released images: ghcr.io/pr0ton11/cs-netcup-bouncer (linux/amd64, linux/arm64).
 #   podman build -t localhost/cs-netcup-bouncer:dev .
-FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.4-trixie@sha256:f18c3d73a184fb0582828510722e723b63a93f7188d11dd223d9be6f6880e65d AS build
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.27.4-trixie@sha256:430985542100b871e108ccc00e8dcc5eef08ca14ee5825e98ebf563d8ffec4ee AS build
 ARG TARGETOS TARGETARCH VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
